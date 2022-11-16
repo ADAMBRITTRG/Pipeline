@@ -1,0 +1,195 @@
+name: 'Postgresql Flightschool DevOps Pipeline'
+
+on:
+  push:
+    branches:
+      - main
+      
+env:
+    FLYWAY_EDITION: enterprise
+    FLYWAY_LOCATIONS: ${{ github.workspace }}/migrations
+    FLYWAY_PROJECT_PATH: postgresql/pagila
+    SQLFLUFF_DIALECT: postgres
+    DOCKER_IMAGE: redgate/flyway
+
+jobs:
+  Continuous-Integration-Build:
+    name: Continuous Integration Build
+    runs-on: ubuntu-20.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3.0.0
+        
+      - name: Redgate Clone Installation
+        run: curl https://redgate-internal.redgate-platform.com/cloning-api/download/cli/linux-amd64 | tar xz
+      - name: Redgate Clone Configuration
+        run: export RGCLONE_API_ENDPOINT=https://redgate-internal.redgate-platform.com
+      - name: Redgate Clone Authorisation
+        run: ./rgclone auth -t "${{ secrets.RGC_AUTH_TOKEN }}"
+      - name: Redgate Clone Initalisation
+        run: ./rgclone create data-container --image pg-pagila --name FS1
+          
+      - name: Redgate Clone Creation of Build_Database
+        id: clonedetails_FS1
+        run: |-
+          echo "PORT=$(./rgclone get data-container CR1 -o json | jq .port)" >> $GITHUB_OUTPUT
+          echo "USERNAME=$(./rgclone get data-container CR1 -o json | jq .user -j)" >> $GITHUB_OUTPUT
+          echo "PASSWORD=$(./rgclone get data-container CR1 -o json | jq .password -j)" >> $GITHUB_OUTPUT 
+#     - run: echo "The selected clone is ${{ steps.clonedetails_FS1.outputs.PORT }}"
+#     - run: echo "The selected clone is ${{ steps.clonedetails_FS1.outputs.USERNAME }}"
+#     - run: echo "The selected clone is ${{ steps.clonedetails_FS1.outputs.PASSWORD }}" 
+       
+      - name: Continuous Integration Flyway Clean Migrate
+        run: >-
+          docker run --rm
+          --volume ${{ github.workspace }}/migrations:/flyway/sql:ro
+          "${{ env.DOCKER_IMAGE }}"
+          -licenseKey="${{ secrets.FLYWAY_LICENSE_KEY }}"
+          -url="jdbc:postgresql://redgate-internal.redgate-platform.com:${{ steps.clonedetails_FS1.outputs.PORT }}/postgres" 
+          -user="${{ steps.clonedetails_FS1.outputs.USERNAME }}" 
+          -cpassword="${{ steps.clonedetails_FS1.outputs.PASSWORD }}" 
+          -cleanDisabled=false clean migrate -schemas=public -connectRetries=10
+          
+      - name: Flyway Info
+        run: >-
+          docker run --rm
+          --volume ${{ github.workspace }}/migrations:/flyway/sql:ro
+          "${{ env.DOCKER_IMAGE }}"
+          -licenseKey="${{ secrets.FLYWAY_LICENSE_KEY }}"
+          -url="jdbc:postgresql://redgate-internal.redgate-platform.com:${{ steps.clonedetails_FS1.outputs.PORT }}/postgres" 
+          -user="${{ steps.clonedetails_FS1.outputs.USERNAME }}" 
+          -cpassword="${{ steps.clonedetails_FS1.outputs.PASSWORD }}" 
+          info -schemas=public
+          
+      - name: Flyway Info Production
+        run: >-
+          docker run --rm
+          --volume ${{ github.workspace }}/migrations:/flyway/sql:ro
+          "${{ env.DOCKER_IMAGE }}"
+          -licenseKey="${{ secrets.FLYWAY_LICENSE_KEY }}"
+          -url="${{ secrets.DB_PROD_URL }}"
+          -user="${{ secrets.DB_PROD_USER }}" 
+          -password="${{ secrets.DB_PROD_PASSWORD }}"
+          info -schemas=public
+        
+      - name: Flyway Check
+        run: >-
+          docker run --rm \
+            --volume ${{ github.workspace }}/migrations:/flyway/sql:ro \
+            --volume ${{ github.workspace }}/reports:/flyway/reports \
+            -e ${{ secrets.FLYWAY_LICENSE_KEY }} \
+            "${{ env.DOCKER_IMAGE }}" \
+            -licenseKey="${{ secrets.FLYWAY_LICENSE_KEY }}" \
+            -url="${{ secrets.DB_PROD_URL }}" \
+            -user="${{ secrets.DB_PROD_USER }}" \
+            -password="${{ secrets.DB_PROD_PASSWORD }}" \
+            -baselineOnMigrate=true check -changes -drift -dryrun -schemas=public -outOfOrder=true -connectRetries=10 \
+            -check.buildUrl="jdbc:postgresql://redgate-internal.redgate-platform.com:${{ steps.clonedetails_FS1.outputs.PORT }}/postgres" \
+            -check.buildUser="${{ steps.clonedetails_FS1.outputs.USERNAME }}" \
+            -check.buildPassword="${{ steps.clonedetails_FS1.outputs.PASSWORD }}" \
+            -check.reportFilename="/flyway/reports/report.htm.htm"
+            
+      - name: Get summary
+        id: summary
+        run: echo ::set-output name=summary::$(build/flyway-summary.sh src/database/reports/report.htm.json) >> $GITHUB_OUTPUT
+
+      - name: Upload report
+        uses: actions/upload-artifact@v3
+        with:
+          name: Database Report
+          path: reports/
+
+      - name: Redgate Clone Deleted
+        run: ./rgclone delete data-container FS1
+        
+        
+  Deploy-Test:
+    name: Deploy Test
+    needs: Continuous-Integration-Build
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v3.0.0
+      - run: >-    
+          docker run --rm
+          --volume ${{ github.workspace }}/migrations:/flyway/sql:ro
+          "${{ env.DOCKER_IMAGE }}"
+          -licenseKey="${{ secrets.FLYWAY_LICENSE_KEY }}"
+          -url="${{ secrets.DB_STAGE_URL }}"
+          -user="${{ secrets.DB_STAGE_USER }}"
+          -password="${{ secrets.DB_STAGE_PASSWORD }}"
+          info -schemas=public 
+      - run: >-
+          docker run --rm
+          --volume ${{ github.workspace }}/migrations:/flyway/sql:ro
+          "${{ env.DOCKER_IMAGE }}"
+          -licenseKey="${{ secrets.FLYWAY_LICENSE_KEY }}"
+          -url="${{ secrets.DB_STAGE_URL }}"
+          -user="${{ secrets.DB_STAGE_USER }}"
+          -password="${{ secrets.DB_STAGE_PASSWORD }}"
+          migrate -schemas=public -outOfOrder=true 
+      - run: >-
+          docker run --rm
+          --volume ${{ github.workspace }}/migrations:/flyway/sql:ro
+          "${{ env.DOCKER_IMAGE }}"
+          -licenseKey="${{ secrets.FLYWAY_LICENSE_KEY }}"
+          -url="${{ secrets.DB_STAGE_URL }}"
+          -user="${{ secrets.DB_STAGE_USER }}"
+          -password="${{ secrets.DB_STAGE_PASSWORD }}"
+          info -schemas=public
+   
+   
+  Deploy-Prod:
+    name: Deploy Prod
+    needs: Deploy-Test
+    runs-on: ubuntu-20.04         
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3.0.0
+      
+      - name: Redgate Clone Installation
+        run: curl https://redgate-internal.redgate-platform.com/cloning-api/download/cli/linux-amd64 | tar xz
+      - name: Redgate Clone Configuration
+        run: export RGCLONE_API_ENDPOINT=https://redgate-internal.redgate-platform.com
+      - name: Redgate Clone Authorisation
+        run: ./rgclone auth -t "${{ secrets.RGC_AUTH_TOKEN }}"
+      - name: Redgate Clone Initalisation
+        run: ./rgclone create data-container --image pg-pagila --name FS1
+          
+      - name: Redgate Clone Creation of Build_Database
+        id: clonedetails_FS2
+        run: |-
+          echo "PORT=$(./rgclone get data-container FS2 -o json | jq .port)" >> $GITHUB_OUTPUT
+          echo "USERNAME=$(./rgclone get data-container FS2 -o json | jq .user -j)" >> $GITHUB_OUTPUT
+          echo "PASSWORD=$(./rgclone get data-container FS2 -o json | jq .password -j)" >> $GITHUB_OUTPUT 
+#     - run: echo "The selected clone is ${{ steps.clonedetails_FS2.outputs.PORT }}"
+#     - run: echo "The selected clone is ${{ steps.clonedetails_FS2.outputs.USERNAME }}"
+#     - run: echo "The selected clone is ${{ steps.clonedetails_FS2.outputs.PASSWORD }}" 
+       
+      - name: Flyway Check
+        run: >-
+          docker run --rm \
+            --volume ${{ github.workspace }}/migrations:/flyway/sql:ro \
+            --volume ${{ github.workspace }}/reports:/flyway/reports \
+            -e ${{ secrets.FLYWAY_LICENSE_KEY }} \
+            "${{ env.DOCKER_IMAGE }}" \
+            -licenseKey="${{ secrets.FLYWAY_LICENSE_KEY }}" \
+            -url="${{ secrets.DB_PROD_URL }}" \
+            -user="${{ secrets.DB_PROD_USER }}" \
+            -password="${{ secrets.DB_PROD_PASSWORD }}" \
+            -baselineOnMigrate=true check -changes -drift -dryrun -schemas=public -outOfOrder=true -connectRetries=10 \
+            -check.buildUrl="jdbc:postgresql://redgate-internal.redgate-platform.com:${{ steps.clonedetails_FS2.outputs.PORT }}/postgres" \
+            -check.buildUser="${{ steps.clonedetails_FS2.outputs.USERNAME }}" \
+            -check.buildPassword="${{ steps.clonedetails_FS2.outputs.PASSWORD }}" \
+            -check.reportFilename="/flyway/reports/report.htm.htm"
+            
+      - name: Get summary
+        id: summary
+        run: echo ::set-output name=summary::$(build/flyway-summary.sh src/database/reports/report.htm.json) >> $GITHUB_OUTPUT
+
+      - name: Upload report
+        uses: actions/upload-artifact@v3.0.0
+        with:
+          name: Database Report
+          path: reports/
+            
